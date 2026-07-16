@@ -18,6 +18,8 @@ from dashboard_data import (
 
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
+AUTO_REFRESH_INTERVAL: str | None = None  # Set to "60s" to enable automatic refresh.
+LIVE_ACTIVITY_LIMIT = 5
 
 st.set_page_config(
     page_title="AI Employee | SAP Operations",
@@ -29,21 +31,27 @@ st.set_page_config(
 
 def asset_data_url(path: Path) -> str:
     suffix = path.suffix.lower()
-    mime = "image/gif" if suffix == ".gif" else "image/png"
+    mime_types = {
+        ".gif": "image/gif",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }
+    mime = mime_types.get(suffix, "application/octet-stream")
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 
 def employee_asset() -> Path:
-    gif_path = ASSETS_DIR / "ai-employee.gif"
-    if gif_path.exists():
-        return gif_path
+    for filename in ("ai-employee.webp", "ai-employee.gif"):
+        animated_path = ASSETS_DIR / filename
+        if animated_path.exists():
+            return animated_path
     return ASSETS_DIR / "ai-operator.png"
 
 
 def load_dashboard_sources() -> DashboardData:
     st.sidebar.markdown("## Data settings")
-    mode = st.sidebar.radio("Data mode", ["Demo", "Connected sources"])
+    mode = st.sidebar.radio("Data mode", ["Demo", "Connected sources"], index=1)
     st.sidebar.caption("Operations: Databricks")
     st.sidebar.caption("Flow status: SharePoint Excel")
     st.sidebar.caption("Live activity: SharePoint CSV/TXT")
@@ -132,34 +140,30 @@ def flow_rows(data: pd.DataFrame) -> str:
     )
     output: list[str] = []
     for _, row in latest.iterrows():
-        status = str(row["status"]).title()
-        failed = bool(row.get("attention_required", False)) or status.lower() in {"failed", "error", "attention"}
-        tone = "danger" if failed else "success"
-        icon = "!" if failed else "✓"
+        status = "Completed"
+        tone = "success"
+        icon = "✓"
         output.append(
             f'<div class="flow-row {tone}">'
             f'<span class="status-orb">{icon}</span>'
             f'<div class="flow-copy"><strong>{html.escape(str(row["flow_name"]))}</strong>'
-            f'<b>{html.escape(status)}</b><small>Last run {row["last_run"]:%H:%M:%S}</small></div>'
-            f'<div class="flow-volume"><strong>{int(row["operation_count"]):,}</strong><span>operations</span></div>'
+            f'<b>{status}</b><small>Latest creation {row["last_run"]:%Y-%m-%d %H:%M:%S}</small></div>'
+            f'<div class="flow-volume"><strong>{int(row["operation_count"]):,}</strong><span>completed today</span></div>'
             "</div>"
         )
     return "".join(output)
 
 
 def activity_rows(data: pd.DataFrame) -> str:
-    latest = data.sort_values("event_time", ascending=False).head(5)
+    latest = data.sort_values("event_time", ascending=False).head(LIVE_ACTIVITY_LIMIT)
     output: list[str] = []
     for _, row in latest.iterrows():
-        status = str(row["status"]).title()
-        failed = status.lower() in {"failed", "error", "attention"}
-        tone = "danger" if failed else "success"
+        event_time = pd.Timestamp(row["event_time"])
         output.append(
-            f'<li><time>{row["event_time"]:%H:%M:%S}</time>'
-            f'<span class="timeline-dot {tone}"></span>'
+            f'<li><time datetime="{event_time:%Y-%m-%dT%H:%M:%S}"><span>Created</span><b>{event_time:%Y-%m-%d %H:%M:%S}</b></time>'
+            f'<span class="timeline-dot success"></span>'
             f'<strong>{html.escape(str(row["flow_name"]))}</strong>'
-            f'<span class="operation-pill">{int(row["operation_count"]):,} operations</span>'
-            f'<em class="{tone}">{html.escape(status)}</em></li>'
+            f'<em class="success">Completed</em></li>'
         )
     return "".join(output)
 
@@ -173,24 +177,25 @@ def render_dashboard() -> None:
     today = operations[operations["event_time"].dt.date == latest_day]
     total_operations = int(operations["operation_count"].sum())
     today_operations = int(today["operation_count"].sum())
-    running = int(flows[flows["status"].str.lower() == "running"]["flow_name"].nunique())
+    running_flows = int(flows["flow_name"].nunique())
     exceptions = int(flows["attention_required"].sum())
     source_label = dashboard.source_label
     robot_url = asset_data_url(employee_asset())
+    background_url = asset_data_url(ASSETS_DIR / "dashboard-background.png")
     now = datetime.now()
 
     st.markdown(
         "".join(
             line.strip()
             for line in f"""
-        <main class="dashboard-viewport">
+        <main class="dashboard-viewport" style="background-image: url('{background_url}')">
           <header class="app-header">
             <div class="brand-mark" aria-hidden="true"><i></i><i></i></div>
             <strong class="brand-name" aria-label="AI Employee"><span>AI</span><span>EMPLOYEE</span></strong>
             <div class="brand-line"><span></span><p>People-led, AI powered</p><span></span></div>
             <div class="system-state"><i></i><span>SYSTEM ONLINE</span></div>
             <div class="refresh-state"><span>Last refreshed</span><strong>{now:%Y-%m-%d %H:%M:%S}</strong><small>{html.escape(source_label)}</small></div>
-            <div class="profile"><span>AI</span><div><strong>Wally / 小库</strong><small>AI Digital Employee</small></div></div>
+            <div class="profile"><span>AI</span><div><strong>Wally</strong><small>AI Digital Employee</small></div></div>
           </header>
 
           <section class="hero-row">
@@ -200,12 +205,12 @@ def render_dashboard() -> None:
 
             <div class="speech-card">
               <div class="speaker"><span>AI</span><div><strong>Wally</strong><small>Operations assistant</small></div></div>
-              <h2>Good morning!</h2>
-              <p>Here is the status of SAP operations today.</p>
+              <h2 class="typewriter-line typewriter-1">Good morning!</h2>
+              <p class="typewriter-line typewriter-2">Here is the status of SAP operations today.</p>
               <ul>
-                <li><b>✓</b>{today_operations:,} operations processed today</li>
-                <li><b>✓</b>{running} flows are running smoothly</li>
-                <li><b class="green">✓</b>{exceptions} exceptions require attention</li>
+                <li class="typewriter-line typewriter-3"><b>✓</b>{today_operations:,} operations processed today</li>
+                <li class="typewriter-line typewriter-4"><b>✓</b>{running_flows} movement flows are running today</li>
+                <li class="typewriter-line typewriter-5"><b class="green">✓</b>{exceptions} exceptions require attention</li>
               </ul>
             </div>
 
@@ -239,13 +244,13 @@ def render_dashboard() -> None:
               </article>
 
               <article class="glass-card activity-card">
-                <div class="card-heading"><span class="card-icon pulse-icon">⌁</span><div><h2>Live Activity</h2><p>Latest SAP automation events</p></div><small>Auto refresh · 60s</small></div>
+                <div class="card-heading"><span class="card-icon pulse-icon">⌁</span><div><h2>Live Activity</h2><p>Latest completed SAP movement records</p></div><small>Latest {LIVE_ACTIVITY_LIMIT} events</small></div>
               <ul class="activity-list">{activity_rows(activities)}</ul>
               </article>
             </div>
 
             <article class="glass-card flow-card">
-              <div class="card-heading"><span class="card-icon">⌘</span><div><h2>Flow Status</h2><p>Current automation health</p></div><small>All flows ›</small></div>
+              <div class="card-heading"><span class="card-icon">⌘</span><div><h2>Flow Status</h2><p>Today's completed movements</p></div><small>All flows ›</small></div>
               <div class="flow-list">{flow_rows(flows)}</div>
             </article>
 
@@ -311,7 +316,7 @@ st.markdown(
       [data-testid="stSidebarCollapsedControl"] { opacity: .12; transition: opacity .18s ease; z-index: 100; }
       [data-testid="stSidebarCollapsedControl"]:hover { opacity: 1; }
 
-      .dashboard-viewport { position: relative; z-index: 1; width: 100%; height: 100vh; display: grid; grid-template-rows: 8.4vh 37.2vh minmax(0, 1fr); gap: 1.5vh; padding: 0 1.15vw 1.4vh; overflow: hidden; }
+      .dashboard-viewport { position: relative; z-index: 1; width: 100%; height: 100vh; display: grid; grid-template-rows: 8.4vh 37.2vh minmax(0, 1fr); gap: 1.5vh; padding: 0 1.15vw 1.4vh; overflow: hidden; background-size: cover; background-position: center; background-repeat: no-repeat; }
       .glass-card, .speech-card { background: var(--glass); border: 1px solid rgba(255,255,255,.82); border-radius: clamp(16px, 1.35vw, 24px); box-shadow: var(--shadow); backdrop-filter: blur(24px) saturate(155%); -webkit-backdrop-filter: blur(24px) saturate(155%); }
 
       .app-header { margin: 0 -1.15vw; padding: 0 1.55vw; display: grid; grid-template-columns: auto auto 1fr auto auto auto; gap: 1vw; align-items: center; color: white; background: linear-gradient(100deg, #041044, #071957 56%, #10246f); border-bottom: 1px solid rgba(92,145,255,.5); box-shadow: 0 10px 30px rgba(4,18,74,.2); }
@@ -333,7 +338,7 @@ st.markdown(
 
       .hero-row { min-height: 0; display: grid; grid-template-columns: 1.4fr 1.15fr 2.35fr; gap: 1vw; }
       .robot-card { position: relative; z-index: 1; min-width: 0; display: flex; align-items: flex-end; justify-content: center; overflow: visible; }
-      .robot-card img { position: relative; width: 148%; max-width: 600px; max-height: 140%; object-fit: contain; object-position: center bottom; margin-bottom: -10%; filter: drop-shadow(0 18px 20px rgba(15,53,111,.22)); }
+      .robot-card img { position: relative; width: 145%; max-width: 640px; max-height: 112%; object-fit: contain; object-position: center bottom; margin-bottom: -1.2%; filter: drop-shadow(0 18px 20px rgba(15,53,111,.18)); }
 
       .speech-card { position: relative; z-index: 2; padding: clamp(14px, 1.2vw, 22px); background: var(--glass-strong); display: flex; flex-direction: column; justify-content: center; }
       .speech-card::before { content: ""; position: absolute; z-index: 2; left: -21px; top: 50%; width: 22px; height: 38px; background: rgba(247,251,255,.86); clip-path: polygon(0 50%, 100% 0, 100% 100%); transform: translateY(-50%); filter: drop-shadow(-1px 0 0 rgba(255,255,255,.82)); }
@@ -346,6 +351,17 @@ st.markdown(
       .speech-card li { display: flex; align-items: center; gap: 8px; color: #19345e; font-size: clamp(.58rem,.68vw,.76rem); }
       .speech-card li b { flex: 0 0 auto; width: 17px; height: 17px; display: grid; place-items: center; border-radius: 50%; background: var(--blue); color: white; font-size: .6rem; }
       .speech-card li b.green { background: var(--green); }
+      .typewriter-line { overflow: hidden; white-space: nowrap; clip-path: inset(0 100% 0 0); will-change: clip-path; animation-duration: 17s; animation-timing-function: steps(32, end); animation-iteration-count: infinite; animation-fill-mode: both; }
+      .typewriter-1 { animation-name: typewriter-1; }
+      .typewriter-2 { animation-name: typewriter-2; }
+      .typewriter-3 { animation-name: typewriter-3; }
+      .typewriter-4 { animation-name: typewriter-4; }
+      .typewriter-5 { animation-name: typewriter-5; }
+      @keyframes typewriter-1 { 0% { clip-path: inset(0 100% 0 0); } 5%, 98% { clip-path: inset(0 0 0 0); } 98.1%, 100% { clip-path: inset(0 100% 0 0); } }
+      @keyframes typewriter-2 { 0%, 5% { clip-path: inset(0 100% 0 0); } 13%, 98% { clip-path: inset(0 0 0 0); } 98.1%, 100% { clip-path: inset(0 100% 0 0); } }
+      @keyframes typewriter-3 { 0%, 13% { clip-path: inset(0 100% 0 0); } 21%, 98% { clip-path: inset(0 0 0 0); } 98.1%, 100% { clip-path: inset(0 100% 0 0); } }
+      @keyframes typewriter-4 { 0%, 21% { clip-path: inset(0 100% 0 0); } 29%, 98% { clip-path: inset(0 0 0 0); } 98.1%, 100% { clip-path: inset(0 100% 0 0); } }
+      @keyframes typewriter-5 { 0%, 29% { clip-path: inset(0 100% 0 0); } 37%, 98% { clip-path: inset(0 0 0 0); } 98.1%, 100% { clip-path: inset(0 100% 0 0); } }
 
       .total-card { min-width: 0; display: grid; grid-template-columns: .92fr 1.55fr; padding: clamp(15px, 1.35vw, 24px); }
       .total-metric { padding-right: 1.4vw; border-right: 1px solid var(--line); display: flex; flex-direction: column; justify-content: center; }
@@ -385,12 +401,19 @@ st.markdown(
       .card-heading > small { margin-left: auto; color: var(--muted); font-size: clamp(.5rem,.58vw,.65rem); white-space: nowrap; }
 
       .activity-list { position: relative; list-style: none; margin: .7vh 0 0; padding: 0; display: grid; gap: min(.65vh, 7px); }
-      .activity-list::before { content: ""; position: absolute; left: calc(clamp(58px,5vw,90px) + 4px); top: 8px; bottom: 8px; width: 1px; background: linear-gradient(#8ec0ff, #dce9f9); }
-      .activity-list li { display: grid; grid-template-columns: clamp(58px,5vw,90px) 10px minmax(72px,1fr) auto auto; align-items: center; gap: clamp(6px,.65vw,12px); color: #20395f; font-size: clamp(.56rem,.66vw,.75rem); }
-      .activity-list time { color: #314d78; font-variant-numeric: tabular-nums; }
+      .activity-list::before { content: ""; position: absolute; left: calc(clamp(126px,9.2vw,150px) + 4px); top: 8px; bottom: 8px; width: 1px; background: linear-gradient(#8ec0ff, #dce9f9); }
+      .activity-list li { display: grid; grid-template-columns: clamp(126px,9.2vw,150px) 10px minmax(96px,1fr) auto; align-items: center; gap: clamp(6px,.65vw,12px); color: #20395f; font-size: clamp(.56rem,.66vw,.75rem); opacity: 0; transform: translateY(12px); animation: activity-roll-in .42s cubic-bezier(.22,1,.36,1) forwards; }
+      .activity-list li:nth-child(1) { animation-delay: .04s; }
+      .activity-list li:nth-child(2) { animation-delay: .09s; }
+      .activity-list li:nth-child(3) { animation-delay: .14s; }
+      .activity-list li:nth-child(4) { animation-delay: .19s; }
+      .activity-list li:nth-child(5) { animation-delay: .24s; }
+      @keyframes activity-roll-in { to { opacity: 1; transform: translateY(0); } }
+      .activity-list time { min-width: 0; display: flex; flex-direction: column; color: #314d78; font-variant-numeric: tabular-nums; line-height: 1.15; }
+      .activity-list time span { margin-bottom: 2px; color: #6a80a2; font-size: .78em; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+      .activity-list time b { color: #29466f; font-size: .94em; font-weight: 600; white-space: nowrap; }
       .timeline-dot { position: relative; z-index: 1; width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(10,173,67,.1); }
       .timeline-dot.danger { background: var(--red); box-shadow: 0 0 0 4px rgba(239,90,71,.1); }
-      .operation-pill { padding: 5px 9px; border-radius: 99px; background: rgba(33,104,239,.08); color: #1554c4; white-space: nowrap; }
       .activity-list em { min-width: 58px; padding: 4px 7px; border-radius: 99px; background: rgba(10,173,67,.08); color: var(--green); text-align: center; font-style: normal; font-size: .9em; }
       .activity-list em.danger { background: rgba(239,90,71,.09); color: var(--red); }
 
@@ -422,35 +445,21 @@ st.markdown(
       .chat-cta { position: relative; z-index: 1; min-height: 44px; margin-top: auto; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; border-radius: 13px; color: white; background: linear-gradient(100deg, #185bd8, #2b78f2); box-shadow: 0 10px 22px rgba(33,104,239,.25), inset 0 1px 0 rgba(255,255,255,.2); font-size: clamp(.68rem,.78vw,.88rem); font-weight: 700; cursor: not-allowed; opacity: .9; }
       .chat-cta b { font-size: 1.25rem; }
 
-      @media (max-width: 1180px), (max-aspect-ratio: 3/2) {
-        html, body, [data-testid="stAppViewContainer"], .stApp, [data-testid="stMain"] { height: auto; min-height: 100%; overflow: auto; }
-        .block-container { height: auto; min-height: 100vh; }
-        .dashboard-viewport { height: auto; min-height: 100vh; grid-template-rows: auto; overflow: visible; padding-bottom: 16px; }
-        .app-header { min-height: 72px; } .brand-line, .refresh-state { display: none; } .app-header { grid-template-columns: auto auto 1fr auto auto; }
-        .hero-row { grid-template-columns: 1fr 1fr; min-height: 520px; } .total-card { grid-column: 1 / -1; min-height: 270px; }
-        .content-row { grid-template-columns: 1fr 1fr; } .activity-column { min-height: 520px; grid-template-rows: auto minmax(360px,1fr); } .chat-card { grid-column: 1 / -1; min-height: 280px; }
-      }
-      @media (max-width: 700px) {
-        .dashboard-viewport { padding-inline: 10px; gap: 10px; } .app-header { margin-inline: -10px; padding-inline: 12px; }
-        .profile div, .system-state span { display: none; } .brand-name { font-size: 1.25rem; }
-        .hero-row, .content-row { grid-template-columns: 1fr; } .total-card, .chat-card { grid-column: auto; }
-        .activity-column { min-height: 620px; grid-template-rows: auto minmax(420px,1fr); } .capability-list { grid-template-columns: 1fr; }
-        .robot-card { min-height: 300px; } .speech-card::before { left: 50%; top: -21px; width: 38px; height: 22px; clip-path: polygon(50% 0, 100% 100%, 0 100%); transform: translateX(-50%); }
-        .total-card { grid-template-columns: 1fr; } .total-metric { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 14px; } .trend-panel { padding: 14px 0 0; }
-        .activity-list li { grid-template-columns: 62px 10px 1fr; } .operation-pill, .activity-list em { display: none; }
-      }
-      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } .typewriter-line { animation: none !important; clip-path: inset(0) !important; } }
     </style>
         """
     ),
     unsafe_allow_html=True,
 )
 
-try:
-    @st.fragment(run_every="60s")
-    def refreshing_dashboard() -> None:
-        render_dashboard()
+if AUTO_REFRESH_INTERVAL:
+    try:
+        @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
+        def refreshing_dashboard() -> None:
+            render_dashboard()
 
-    refreshing_dashboard()
-except AttributeError:
+        refreshing_dashboard()
+    except AttributeError:
+        render_dashboard()
+else:
     render_dashboard()

@@ -157,10 +157,8 @@ def load_demo_flow_status() -> pd.DataFrame:
     return validate_flow_status(
         pd.DataFrame(
             [
-                {"flow_name": "VA01_728", "status": "Completed", "last_run": now - timedelta(minutes=5), "operation_count": 8},
-                {"flow_name": "MM02_452", "status": "Completed", "last_run": now - timedelta(minutes=74), "operation_count": 11},
-                {"flow_name": "LB10_914", "status": "Running", "last_run": now - timedelta(minutes=143), "operation_count": 14},
-                {"flow_name": "LU04_321", "status": "Running", "last_run": now - timedelta(minutes=212), "operation_count": 18},
+                {"flow_name": "LB10 Movement Record", "status": "Completed", "last_run": now - timedelta(minutes=5), "operation_count": 8},
+                {"flow_name": "LU04 Movement Record", "status": "Completed", "last_run": now - timedelta(minutes=74), "operation_count": 11},
             ]
         )
     )
@@ -169,19 +167,17 @@ def load_demo_flow_status() -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_demo_activity() -> pd.DataFrame:
     now = datetime.now().replace(second=0, microsecond=0)
-    flows = ["VA01_728", "MM02_452", "LB10_914", "LU04_321", "VA01_728"]
-    statuses = ["Completed", "Completed", "Running", "Running", "Completed"]
-    counts = [8, 11, 14, 18, 53]
+    flows = ["LB10 Movement Record", "LU04 Movement Record", "LB10 Movement Record", "LU04 Movement Record", "LB10 Movement Record"]
     rows = []
-    for index, (flow, status, count) in enumerate(zip(flows, statuses, counts)):
+    for index, flow in enumerate(flows):
         rows.append(
             {
                 "event_time": now - timedelta(minutes=index * 31),
                 "flow_name": flow,
-                "event_type": "flow_completed" if status == "Completed" else "flow_started",
-                "status": status,
-                "operation_count": count,
-                "message": f"{flow} {status.lower()}",
+                "event_type": "movement_completed",
+                "status": "Completed",
+                "operation_count": 0,
+                "message": f"{flow} completed",
             }
         )
     return validate_activity(pd.DataFrame(rows))
@@ -211,6 +207,105 @@ def load_databricks_operations() -> pd.DataFrame:
     except Exception as error:
         raise DataSourceError(f"Databricks query failed: {error}") from error
     return validate_operations(data)
+
+
+@st.cache_data(ttl=55, show_spinner=False)
+def load_databricks_movements() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return latest completed movements and today's completed count by SAP flow."""
+    try:
+        from databricks import sql
+    except ImportError as error:
+        raise DataSourceError("Databricks connector is not installed.") from error
+
+    movement_cte = """
+        WITH latest_ltak AS (
+          SELECT
+            TANUM,
+            BWART,
+            BNAME,
+            KQUIT,
+            BDATU,
+            BZEIT,
+            QDATU,
+            src_commit_time,
+            ROW_NUMBER() OVER (
+              PARTITION BY TANUM
+              ORDER BY src_commit_time DESC
+            ) AS row_number
+          FROM prod_l1.mbp.ltak
+          WHERE BNAME IN ('320120939', '320134259')
+            AND BWART IN ('261', '321')
+        ),
+        completed_movements AS (
+          SELECT
+            TANUM,
+            BWART,
+            QDATU,
+            to_timestamp(
+              concat(CAST(BDATU AS STRING), lpad(CAST(BZEIT AS STRING), 6, '0')),
+              'yyyyMMddHHmmss'
+            ) AS event_time
+          FROM latest_ltak
+          WHERE row_number = 1
+            AND KQUIT = 'X'
+            AND BDATU <> '00000000'
+        )
+    """
+    activity_query = movement_cte + """
+        SELECT
+          event_time,
+          CASE BWART
+            WHEN '261' THEN 'LB10 Movement Record'
+            WHEN '321' THEN 'LU04 Movement Record'
+          END AS flow_name,
+          'Completed' AS status,
+          'movement_completed' AS event_type,
+          0 AS operation_count,
+          concat('Transfer order ', TANUM) AS message,
+          BWART AS movement_type,
+          TANUM AS movement_record
+        FROM completed_movements
+        WHERE event_time IS NOT NULL
+        ORDER BY event_time DESC
+        LIMIT 5
+    """
+    flow_query = movement_cte + """
+        SELECT
+          CASE BWART
+            WHEN '261' THEN 'LB10 Movement Record'
+            WHEN '321' THEN 'LU04 Movement Record'
+          END AS flow_name,
+          'Completed' AS status,
+          MAX(event_time) AS last_run,
+          COUNT(DISTINCT TANUM) AS operation_count,
+          FALSE AS attention_required,
+          '' AS attention_reason
+        FROM completed_movements
+        WHERE QDATU = date_format(current_date(), 'yyyyMMdd')
+        GROUP BY BWART
+        ORDER BY BWART
+    """
+
+    try:
+        config = st.secrets["databricks"]
+        with sql.connect(
+            server_hostname=config["server_hostname"],
+            http_path=config["http_path"],
+            access_token=config["access_token"],
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(activity_query)
+                activity_columns = [column[0] for column in cursor.description]
+                activity_data = pd.DataFrame(cursor.fetchall(), columns=activity_columns)
+                cursor.execute(flow_query)
+                flow_columns = [column[0] for column in cursor.description]
+                flow_data = pd.DataFrame(cursor.fetchall(), columns=flow_columns)
+    except KeyError as error:
+        raise DataSourceError("Databricks secrets are incomplete.") from error
+    except Exception as error:
+        raise DataSourceError(f"Databricks movement query failed: {error}") from error
+
+    return validate_activity(activity_data), validate_flow_status(flow_data)
 
 
 def _sharepoint_config() -> Mapping[str, Any]:
@@ -337,6 +432,7 @@ def load_demo_dashboard() -> DashboardData:
 def load_connected_dashboard() -> DashboardData:
     messages: list[str] = []
     fallback_count = 0
+    used_databricks_movements = False
     try:
         operations = load_databricks_operations()
     except (DataSourceError, ValueError) as error:
@@ -344,21 +440,43 @@ def load_connected_dashboard() -> DashboardData:
         messages.append(f"Databricks: {error}")
         operations = load_demo_operations()
 
+    movement_activities: pd.DataFrame | None = None
+    movement_flows: pd.DataFrame | None = None
+    try:
+        movement_activities, movement_flows = load_databricks_movements()
+    except (DataSourceError, ValueError) as error:
+        messages.append(f"Databricks movements: {error}")
+
     try:
         flows = load_sharepoint_flow_status()
     except (DataSourceError, ValueError) as error:
-        fallback_count += 1
-        messages.append(f"Flow status: {error}")
-        flows = load_demo_flow_status()
+        if movement_flows is not None:
+            used_databricks_movements = True
+            messages.append(f"Flow status: {error} Using Databricks movement totals.")
+            flows = movement_flows
+        else:
+            fallback_count += 1
+            messages.append(f"Flow status: {error}")
+            flows = load_demo_flow_status()
 
     try:
         activities = load_sharepoint_activity()
     except (DataSourceError, ValueError) as error:
-        fallback_count += 1
-        messages.append(f"Live activity: {error}")
-        activities = load_demo_activity()
+        if movement_activities is not None:
+            used_databricks_movements = True
+            messages.append(f"Live activity: {error} Using completed Databricks LTAK records.")
+            activities = movement_activities
+        else:
+            fallback_count += 1
+            messages.append(f"Live activity: {error}")
+            activities = load_demo_activity()
 
-    source_label = "Databricks + SharePoint" if fallback_count == 0 else f"Connected | {fallback_count} demo fallback"
+    if fallback_count:
+        source_label = f"Connected | {fallback_count} demo fallback"
+    elif used_databricks_movements:
+        source_label = "Databricks movement view"
+    else:
+        source_label = "Databricks + SharePoint"
     return DashboardData(
         operations=operations,
         flows=flows,
