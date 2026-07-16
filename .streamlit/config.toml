@@ -1,0 +1,15 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+address = "localhost"
+port = 8501
+
+[theme]
+base = "light"
+primaryColor = "#2164E8"
+backgroundColor = "#EEF6FF"
+secondaryBackgroundColor = "#F5F9FF"
+textColor = "#0B1738"
+font = "sans-serif"
